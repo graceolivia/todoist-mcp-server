@@ -8,6 +8,9 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { TodoistApi } from "@doist/todoist-api-typescript";
+import express from "express";
+import cors from "cors";
+import { Readable, Writable } from "stream";
 
 // Define tools
 const CREATE_TASK_TOOL: Tool = {
@@ -409,13 +412,244 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-async function runServer() {
+async function runHTTPServer(port: number = 3000) {
+  const app = express();
+  
+  app.use(cors());
+  app.use(express.json());
+
+  // Handle tools list endpoint
+  app.get('/tools', async (req, res) => {
+    try {
+      res.json({
+        tools: [CREATE_TASK_TOOL, GET_TASKS_TOOL, UPDATE_TASK_TOOL, DELETE_TASK_TOOL, COMPLETE_TASK_TOOL]
+      });
+    } catch (error) {
+      res.status(500).json({
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+
+  // Handle tool calls
+  app.post('/tools/call', async (req, res) => {
+    try {
+      const { name, arguments: args } = req.body;
+
+      if (!args) {
+        throw new Error("No arguments provided");
+      }
+
+      if (name === "todoist_create_task") {
+        if (!isCreateTaskArgs(args)) {
+          throw new Error("Invalid arguments for todoist_create_task");
+        }
+        const task = await todoistClient.addTask({
+          content: args.content,
+          description: args.description,
+          dueString: args.due_string,
+          priority: args.priority
+        });
+        res.json({
+          content: [{ 
+            type: "text", 
+            text: `Task created:\nTitle: ${task.content}${task.description ? `\nDescription: ${task.description}` : ''}${task.due ? `\nDue: ${task.due.string}` : ''}${task.priority ? `\nPriority: ${task.priority}` : ''}` 
+          }],
+          isError: false,
+        });
+        return;
+      }
+
+      if (name === "todoist_get_tasks") {
+        if (!isGetTasksArgs(args)) {
+          throw new Error("Invalid arguments for todoist_get_tasks");
+        }
+        
+        const apiParams: any = {};
+        if (args.project_id) {
+          apiParams.projectId = args.project_id;
+        }
+        if (args.filter) {
+          apiParams.filter = args.filter;
+        }
+        const tasks = await todoistClient.getTasks(Object.keys(apiParams).length > 0 ? apiParams : undefined);
+
+        let filteredTasks = tasks;
+        if (args.priority) {
+          filteredTasks = filteredTasks.filter(task => task.priority === args.priority);
+        }
+        
+        if (args.limit && args.limit > 0) {
+          filteredTasks = filteredTasks.slice(0, args.limit);
+        }
+        
+        const taskList = filteredTasks.map(task => 
+          `- ${task.content}${task.description ? `\n  Description: ${task.description}` : ''}${task.due ? `\n  Due: ${task.due.string}` : ''}${task.priority ? `\n  Priority: ${task.priority}` : ''}`
+        ).join('\n\n');
+        
+        res.json({
+          content: [{ 
+            type: "text", 
+            text: filteredTasks.length > 0 ? taskList : "No tasks found matching the criteria" 
+          }],
+          isError: false,
+        });
+        return;
+      }
+
+      if (name === "todoist_update_task") {
+        if (!isUpdateTaskArgs(args)) {
+          throw new Error("Invalid arguments for todoist_update_task");
+        }
+
+        const tasks = await todoistClient.getTasks();
+        const matchingTask = tasks.find(task => 
+          task.content.toLowerCase().includes(args.task_name.toLowerCase())
+        );
+
+        if (!matchingTask) {
+          res.json({
+            content: [{ 
+              type: "text", 
+              text: `Could not find a task matching "${args.task_name}"` 
+            }],
+            isError: true,
+          });
+          return;
+        }
+
+        const updateData: any = {};
+        if (args.content) updateData.content = args.content;
+        if (args.description) updateData.description = args.description;
+        if (args.due_string) updateData.dueString = args.due_string;
+        if (args.priority) updateData.priority = args.priority;
+
+        const updatedTask = await todoistClient.updateTask(matchingTask.id, updateData);
+        
+        res.json({
+          content: [{ 
+            type: "text", 
+            text: `Task "${matchingTask.content}" updated:\nNew Title: ${updatedTask.content}${updatedTask.description ? `\nNew Description: ${updatedTask.description}` : ''}${updatedTask.due ? `\nNew Due Date: ${updatedTask.due.string}` : ''}${updatedTask.priority ? `\nNew Priority: ${updatedTask.priority}` : ''}` 
+          }],
+          isError: false,
+        });
+        return;
+      }
+
+      if (name === "todoist_delete_task") {
+        if (!isDeleteTaskArgs(args)) {
+          throw new Error("Invalid arguments for todoist_delete_task");
+        }
+
+        const tasks = await todoistClient.getTasks();
+        const matchingTask = tasks.find(task => 
+          task.content.toLowerCase().includes(args.task_name.toLowerCase())
+        );
+
+        if (!matchingTask) {
+          res.json({
+            content: [{ 
+              type: "text", 
+              text: `Could not find a task matching "${args.task_name}"` 
+            }],
+            isError: true,
+          });
+          return;
+        }
+
+        await todoistClient.deleteTask(matchingTask.id);
+        
+        res.json({
+          content: [{ 
+            type: "text", 
+            text: `Successfully deleted task: "${matchingTask.content}"` 
+          }],
+          isError: false,
+        });
+        return;
+      }
+
+      if (name === "todoist_complete_task") {
+        if (!isCompleteTaskArgs(args)) {
+          throw new Error("Invalid arguments for todoist_complete_task");
+        }
+
+        const tasks = await todoistClient.getTasks();
+        const matchingTask = tasks.find(task => 
+          task.content.toLowerCase().includes(args.task_name.toLowerCase())
+        );
+
+        if (!matchingTask) {
+          res.json({
+            content: [{ 
+              type: "text", 
+              text: `Could not find a task matching "${args.task_name}"` 
+            }],
+            isError: true,
+          });
+          return;
+        }
+
+        await todoistClient.closeTask(matchingTask.id);
+        
+        res.json({
+          content: [{ 
+            type: "text", 
+            text: `Successfully completed task: "${matchingTask.content}"` 
+          }],
+          isError: false,
+        });
+        return;
+      }
+
+      res.status(400).json({
+        content: [{ type: "text", text: `Unknown tool: ${name}` }],
+        isError: true,
+      });
+    } catch (error) {
+      res.status(500).json({
+        content: [
+          {
+            type: "text",
+            text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      });
+    }
+  });
+
+  // Health check endpoint
+  app.get('/health', (req, res) => {
+    res.json({ status: 'ok', server: 'todoist-mcp-server' });
+  });
+
+  app.listen(port, () => {
+    console.log(`Todoist MCP Server running on HTTP port ${port}`);
+    console.log(`Health check: http://localhost:${port}/health`);
+    console.log(`Available tools: http://localhost:${port}/tools`);
+    console.log(`Tool calls: POST http://localhost:${port}/tools/call`);
+  });
+}
+
+async function runStdioServer() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("Todoist MCP Server running on stdio");
 }
 
-runServer().catch((error) => {
+async function main() {
+  const mode = process.env.MCP_TRANSPORT || 'stdio';
+  const port = parseInt(process.env.PORT || '3000', 10);
+
+  if (mode === 'http') {
+    await runHTTPServer(port);
+  } else {
+    await runStdioServer();
+  }
+}
+
+main().catch((error) => {
   console.error("Fatal error running server:", error);
   process.exit(1);
 });
